@@ -14,8 +14,10 @@ CONFIG = {
     "timeframe_confirm": "5m",  
     "limit": 200,
     "poll_interval": 30,
-    "telegram_token": "7985772555:AAFxwAVWDmnihM_BZPpI8b8vso6bdS1jwCI",
-    "telegram_chat_id": os.environ.get("1024585490"),
+    # Citim tokenul din variabila de mediu
+    "telegram_token": os.getenv("TELEGRAM_TOKEN"),
+    # Citim chat id din variabila de mediu
+    "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID"),
     "expiry_suggestion_seconds": 300,
     "top_symbols_count": 20,  
     "max_concurrent_requests": 5,  
