@@ -14,7 +14,6 @@ CONFIG = {
     "timeframe_confirm": "5m",  
     "limit": 200,
     "poll_interval": 30,
-    # Citim tokenul și chat ID-ul din variabile de mediu Railway
     "telegram_token": os.getenv("TELEGRAM_TOKEN"),
     "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID"),
     "expiry_suggestion_seconds": 300,
@@ -27,7 +26,6 @@ CONFIG = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 bot = Bot(token=CONFIG["telegram_token"])
 
-# ---------------- SYMBOLS ----------------
 async def load_symbols(exchange):
     logging.info("Încărcare market data de la exchange...")
     await exchange.load_markets()
@@ -43,23 +41,19 @@ async def load_symbols(exchange):
                 vol = 0
             usdt_pairs.append((symbol, vol))
     
-    # sortăm după volum descrescător
     usdt_pairs.sort(key=lambda x: x[1], reverse=True)
     
-    # eliminăm duplicatele și simbolurile inexistente
-    seen = set()
+    # păstrăm doar simbolurile valide
     top_pairs = []
     for sym, vol in usdt_pairs:
-        if sym not in seen and sym in exchange.symbols:
+        if sym in exchange.symbols:
             top_pairs.append(sym)
-            seen.add(sym)
         if len(top_pairs) >= CONFIG["top_symbols_count"]:
             break
-    
-    logging.info("Top %d perechi USDT după volum: %s", CONFIG["top_symbols_count"], top_pairs)
+
+    logging.info("Top %d perechi USDT după volum (valid): %s", CONFIG["top_symbols_count"], top_pairs)
     return top_pairs
 
-# ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol, timeframe, limit):
     try:
         data = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -70,10 +64,9 @@ async def fetch_ohlcv(exchange, symbol, timeframe, limit):
         df.set_index("timestamp", inplace=True)
         return df
     except Exception as e:
-        logging.exception("Eroare fetch_ohlcv pentru %s: %s", symbol, e)
+        logging.warning("Eroare fetch_ohlcv pentru %s: %s", symbol, e)
         return None
 
-# ---------------- PATTERN ----------------
 def detect_break_and_retest(df, lookback=40, retest_tol=0.003):
     closes = df["close"]
     n = len(closes)
@@ -105,7 +98,6 @@ def detect_break_and_retest(df, lookback=40, retest_tol=0.003):
             }]
     return []
 
-# ---------------- SCOR ----------------
 def score_signal(main_df, confirm_df, pattern_info):
     score = 0
     weights = {"distance": 50, "volume": 50}
@@ -123,51 +115,41 @@ def score_signal(main_df, confirm_df, pattern_info):
             score += weights["volume"]
     return round(score, 1)
 
-# ---------------- TELEGRAM ----------------
 async def send_telegram_message(chat_id, text):
     try:
         await bot.send_message(chat_id=chat_id, text=text)
         logging.info("Mesaj trimis Telegram.")
     except Exception as e:
-        logging.exception("Eroare la trimiterea Telegram: %s", e)
+        logging.warning("Eroare la trimiterea Telegram: %s", e)
 
-# ---------------- ANALYZE ----------------
 async def analyze_symbol(exch, symbol, sent_signals, semaphore):
     async with semaphore:
-        try:
-            main_df = await fetch_ohlcv(exch, symbol, CONFIG["timeframe_main"], CONFIG["limit"])
-            if main_df is None or main_df.empty:
-                return
-            confirm_df = await fetch_ohlcv(exch, symbol, CONFIG["timeframe_confirm"], CONFIG["limit"])
-            if confirm_df is None or confirm_df.empty:
-                return
-            patterns = detect_break_and_retest(confirm_df)
-            if not patterns:
-                return
-            for pattern in patterns:
-                score = score_signal(main_df, confirm_df, pattern)
-                if score >= CONFIG["min_signal_confidence"]:
-                    key = f"{symbol}_{pattern['retest_time']}_{pattern['direction']}"
-                    if key not in sent_signals:
-                        msg = (
-                            f"✅ Semnal {pattern['direction']} ({score}%) – {symbol}\n"
-                            f"Break & Retest confirmat pe {CONFIG['timeframe_confirm']}/{CONFIG['timeframe_main']}\n"
-                            f"Preț: {confirm_df['close'].iloc[-1]:.2f}\n"
-                            f"Retest la: {pattern['retest_time']}\n"
-                            f"Trimis: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
-                        )
-                        await send_telegram_message(CONFIG["telegram_chat_id"], msg)
-                        sent_signals.add(key)
-        except Exception as e:
-            logging.exception("[%s] Eroare in analiza simbol: %s", symbol, e)
+        main_df = await fetch_ohlcv(exch, symbol, CONFIG["timeframe_main"], CONFIG["limit"])
+        if main_df is None or main_df.empty:
+            return
+        confirm_df = await fetch_ohlcv(exch, symbol, CONFIG["timeframe_confirm"], CONFIG["limit"])
+        if confirm_df is None or confirm_df.empty:
+            return
+        patterns = detect_break_and_retest(confirm_df)
+        if not patterns:
+            return
+        for pattern in patterns:
+            score = score_signal(main_df, confirm_df, pattern)
+            if score >= CONFIG["min_signal_confidence"]:
+                key = f"{symbol}_{pattern['retest_time']}_{pattern['direction']}"
+                if key not in sent_signals:
+                    msg = (
+                        f"✅ Semnal {pattern['direction']} ({score}%) – {symbol}\n"
+                        f"Break & Retest confirmat pe {CONFIG['timeframe_confirm']}/{CONFIG['timeframe_main']}\n"
+                        f"Preț: {confirm_df['close'].iloc[-1]:.2f}\n"
+                        f"Retest la: {pattern['retest_time']}\n"
+                        f"Trimis: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+                    )
+                    await send_telegram_message(CONFIG["telegram_chat_id"], msg)
+                    sent_signals.add(key)
 
-# ---------------- MAIN ----------------
 async def main():
-    exchange = getattr(ccxt, CONFIG["exchange"])({
-        "enableRateLimit": True,
-        "options": {"defaultType": "future"}
-    })
-    await exchange.load_markets()
+    exchange = getattr(ccxt, CONFIG["exchange"])({"enableRateLimit": True, "options": {"defaultType": "future"}})
     CONFIG["symbols"] = await load_symbols(exchange)
     semaphore = asyncio.Semaphore(CONFIG["max_concurrent_requests"])
     sent_signals = set()
