@@ -9,48 +9,57 @@ from telegram import Bot
 # ------- CONFIG -------
 CONFIG = {
     "exchange": "binance",
-    "symbols": [],
-    "timeframe_main": "15m",
-    "timeframe_confirm": "5m",
+    "symbols": [],  
+    "timeframe_main": "15m",  
+    "timeframe_confirm": "5m",  
     "limit": 200,
     "poll_interval": 30,
+    # Citim tokenul și chat ID-ul din variabile de mediu Railway
     "telegram_token": os.getenv("TELEGRAM_TOKEN"),
     "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID"),
     "expiry_suggestion_seconds": 300,
-    "top_symbols_count": 20,
-    "max_concurrent_requests": 5,
-    "min_signal_confidence": 60,
+    "top_symbols_count": 20,  
+    "max_concurrent_requests": 5,  
+    "min_signal_confidence": 60,  
 }
 # -----------------------
 
-# Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-
-# Verifică variabilele de mediu
-if not CONFIG["telegram_token"] or not CONFIG["telegram_chat_id"]:
-    logging.error("TELEGRAM_TOKEN sau TELEGRAM_CHAT_ID nu sunt setate! Verifica variabilele de mediu.")
-    raise ValueError("TELEGRAM_TOKEN și TELEGRAM_CHAT_ID sunt necesare.")
-
 bot = Bot(token=CONFIG["telegram_token"])
 
-# ----------------------- FUNCȚII -----------------------
-
+# ---------------- SYMBOLS ----------------
 async def load_symbols(exchange):
     logging.info("Încărcare market data de la exchange...")
-    markets = await exchange.load_markets()
+    await exchange.load_markets()
+    
     usdt_pairs = []
-    for symbol, data in markets.items():
-        if isinstance(symbol, str) and symbol.endswith("/USDT") and data.get("active", True):
+    for symbol, data in exchange.markets.items():
+        if not isinstance(symbol, str):
+            continue
+        if symbol.endswith("/USDT") and data.get("active", True):
             try:
                 vol = float(data.get("info", {}).get("quoteVolume") or data.get("quoteVolume") or 0)
             except Exception:
                 vol = 0
             usdt_pairs.append((symbol, vol))
+    
+    # sortăm după volum descrescător
     usdt_pairs.sort(key=lambda x: x[1], reverse=True)
-    top_pairs = [sym for sym, vol in usdt_pairs[:CONFIG["top_symbols_count"]]]
-    logging.info("Top %d perechi USDT dupa volum: %s", CONFIG["top_symbols_count"], top_pairs)
+    
+    # eliminăm duplicatele și simbolurile inexistente
+    seen = set()
+    top_pairs = []
+    for sym, vol in usdt_pairs:
+        if sym not in seen and sym in exchange.symbols:
+            top_pairs.append(sym)
+            seen.add(sym)
+        if len(top_pairs) >= CONFIG["top_symbols_count"]:
+            break
+    
+    logging.info("Top %d perechi USDT după volum: %s", CONFIG["top_symbols_count"], top_pairs)
     return top_pairs
 
+# ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol, timeframe, limit):
     try:
         data = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -64,12 +73,16 @@ async def fetch_ohlcv(exchange, symbol, timeframe, limit):
         logging.exception("Eroare fetch_ohlcv pentru %s: %s", symbol, e)
         return None
 
+# ---------------- PATTERN ----------------
 def detect_break_and_retest(df, lookback=40, retest_tol=0.003):
     closes = df["close"]
-    if len(closes) < 10:
+    n = len(closes)
+    if n < 10:
         return []
     recent = df[-lookback:]
-    half = len(recent) // 2
+    half = int(len(recent) / 2)
+    if half <= 0:
+        return []
     resistance = recent["high"].iloc[:half].max()
     breakout_zone = recent["close"].iloc[half:]
     breakout_idx = breakout_zone[breakout_zone > resistance].index
@@ -79,6 +92,8 @@ def detect_break_and_retest(df, lookback=40, retest_tol=0.003):
     br_price = recent.loc[br_time, "close"]
     after_br = df.loc[br_time:]
     for t, row in after_br.iterrows():
+        if resistance == 0:
+            continue
         if abs(row["low"] - resistance) / resistance <= retest_tol:
             direction = "LONG" if br_price > resistance else "SHORT"
             return [{
@@ -90,9 +105,11 @@ def detect_break_and_retest(df, lookback=40, retest_tol=0.003):
             }]
     return []
 
+# ---------------- SCOR ----------------
 def score_signal(main_df, confirm_df, pattern_info):
     score = 0
     weights = {"distance": 50, "volume": 50}
+
     resistance = pattern_info.get("resistance") or pattern_info.get("break_price")
     if resistance:
         last_close = confirm_df["close"].iloc[-1]
@@ -106,30 +123,29 @@ def score_signal(main_df, confirm_df, pattern_info):
             score += weights["volume"]
     return round(score, 1)
 
+# ---------------- TELEGRAM ----------------
 async def send_telegram_message(chat_id, text):
     try:
         await bot.send_message(chat_id=chat_id, text=text)
-        logging.info("Mesaj trimis Telegram: %s", text)
+        logging.info("Mesaj trimis Telegram.")
     except Exception as e:
         logging.exception("Eroare la trimiterea Telegram: %s", e)
 
+# ---------------- ANALYZE ----------------
 async def analyze_symbol(exch, symbol, sent_signals, semaphore):
     async with semaphore:
         try:
             main_df = await fetch_ohlcv(exch, symbol, CONFIG["timeframe_main"], CONFIG["limit"])
             if main_df is None or main_df.empty:
-                logging.warning("[%s] Nu s-au obtinut date OHLCV principal.", symbol)
                 return
             confirm_df = await fetch_ohlcv(exch, symbol, CONFIG["timeframe_confirm"], CONFIG["limit"])
             if confirm_df is None or confirm_df.empty:
-                logging.warning("[%s] Nu s-au obtinut date OHLCV confirmare.", symbol)
                 return
             patterns = detect_break_and_retest(confirm_df)
             if not patterns:
                 return
             for pattern in patterns:
                 score = score_signal(main_df, confirm_df, pattern)
-                logging.info("[%s] Semnal %s, scor: %.1f%%", symbol, pattern["direction"], score)
                 if score >= CONFIG["min_signal_confidence"]:
                     key = f"{symbol}_{pattern['retest_time']}_{pattern['direction']}"
                     if key not in sent_signals:
@@ -145,15 +161,16 @@ async def analyze_symbol(exch, symbol, sent_signals, semaphore):
         except Exception as e:
             logging.exception("[%s] Eroare in analiza simbol: %s", symbol, e)
 
-# ----------------------- MAIN -----------------------
-
+# ---------------- MAIN ----------------
 async def main():
-    exchange = getattr(ccxt, CONFIG["exchange"])({"enableRateLimit": True, "options": {"defaultType": "future"}})
+    exchange = getattr(ccxt, CONFIG["exchange"])({
+        "enableRateLimit": True,
+        "options": {"defaultType": "future"}
+    })
     await exchange.load_markets()
     CONFIG["symbols"] = await load_symbols(exchange)
     semaphore = asyncio.Semaphore(CONFIG["max_concurrent_requests"])
     sent_signals = set()
-
     try:
         while True:
             tasks = [analyze_symbol(exchange, sym, sent_signals, semaphore) for sym in CONFIG["symbols"]]
@@ -162,10 +179,5 @@ async def main():
     finally:
         await exchange.close()
 
-# ----------------------- EXECUTARE -----------------------
-
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logging.exception("Eroare la pornirea botului: %s", e)
+    asyncio.run(main())
